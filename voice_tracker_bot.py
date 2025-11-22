@@ -1,259 +1,435 @@
-# NEW CLEAN DISCORD VOICE TRACKER BOT
-# Fully rewritten from zero — clean, stable, Railway-ready, minimal, and organized.
-# Features:
-#  - Track join/leave/move
-#  - Track total VC time
-#  - Live sessions
-#  - Leaderboard
-#  - 24/7 stay in voice
-#  - Volume-friendly (DATA_DIR)
-#  - LOG_CHANNEL_ID optional
-#  - Stable async file I/O
+# voice_tracker_bot.py
+"""
+Clean, complete Discord voice tracker bot.
+
+Environment variables:
+  DISCORD_TOKEN   (required) - your bot token
+  DATA_DIR        (optional) - path for JSON files (default: current directory)
+  LOG_CHANNEL_ID  (optional) - channel ID for embed logs
+  BOT_PREFIX      (optional) - default: "!"
+  STAY_CHECK_INTERVAL (optional) - seconds (default: 30)
+
+IMPORTANT:
+- Enable privileged intents in Discord Developer Portal:
+  * SERVER MEMBERS INTENT
+  * MESSAGE CONTENT INTENT
+- Restart the bot after toggling intents.
+"""
 
 import os
 import json
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+import traceback
 import discord
 from discord.ext import commands
+from typing import Optional, Dict
 
-# ==============================
-# CONFIG / ENV
-# ==============================
+# -------------------- Configuration --------------------
 BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
-DATA_DIR.mkdir(exist_ok=True, parents=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_FILE = DATA_DIR / "voice_history.json"
 TOTALS_FILE = DATA_DIR / "user_totals.json"
-STAY_FILE = DATA_DIR / "stay.json"
+STAY_FILE = DATA_DIR / "persistent_stays.json"
 
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
 LOG_CHANNEL_ID = int(LOG_CHANNEL_ID) if LOG_CHANNEL_ID and LOG_CHANNEL_ID.isdigit() else None
 
-INTENTS = discord.Intents.default()
-INTENTS.voice_states = True
-INTENTS.guilds = True
-INTENTS.members = True
+STAY_CHECK_INTERVAL = int(os.getenv("STAY_CHECK_INTERVAL", "30"))
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "2000"))
 
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=INTENTS)
+# -------------------- Intents --------------------
+intents = discord.Intents.default()
+intents.guilds = True
+intents.voice_states = True
+intents.members = True            # privileged: enable in Developer Portal
+intents.message_content = True    # privileged: enable in Developer Portal
 
-# ==============================
-# GLOBAL DATA
-# ==============================
-voice_history = []          # list[str]
-user_totals = {}            # {str(user_id): seconds}
-active_sessions = {}        # {user_id: timestamp}
-stay_channels = {}          # {guild_id: channel_id}
+# -------------------- Bot --------------------
+bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
+
+# -------------------- Data structures --------------------
 _file_lock = asyncio.Lock()
+voice_history: list = []                       # human-readable lines
+user_totals: Dict[str, int] = {}               # {str(user_id): total_seconds}
+user_sessions: Dict[int, float] = {}           # {user_id: start_timestamp}
+persistent_stays: Dict[int, int] = {}          # {guild_id: channel_id}
 
-# ==============================
-# HELPERS
-# ==============================
-def now(): return datetime.now(timezone.utc)
+# -------------------- Helpers --------------------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def fmt_time(sec):
+def ts() -> str:
+    return now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def fmt_duration(sec: int) -> str:
     sec = int(sec)
     m, s = divmod(sec, 60)
     h, m = divmod(m, 60)
-    if h: return f"{h}h {m}m {s}s"
-    if m: return f"{m}m {s}s"
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
     return f"{s}s"
 
-async def save_json(path, data):
+async def safe_write_json(path: Path, data) -> None:
     async with _file_lock:
         tmp = str(path) + ".tmp"
-        with open(tmp, "w", encoding="utf8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+        os.replace(tmp, str(path))
 
-def load_json(path, default):
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf8") as f:
+def safe_read_json(path: Path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except:
-            return default
+    except Exception:
+        print(f"[WARN] Failed to read {path}; using default.")
     return default
 
-async def get_log_channel():
-    if LOG_CHANNEL_ID is None: return None
-    ch = bot.get_channel(LOG_CHANNEL_ID)
-    if ch: return ch
-    try: return await bot.fetch_channel(LOG_CHANNEL_ID)
-    except: return None
+async def persist_all():
+    await asyncio.gather(
+        safe_write_json(HISTORY_FILE, voice_history),
+        safe_write_json(TOTALS_FILE, user_totals),
+        safe_write_json(STAY_FILE, {str(k): v for k, v in persistent_stays.items()}),
+    )
 
-# ==============================
-# LOAD DATA ON START
-# ==============================
+async def get_log_channel() -> Optional[discord.TextChannel]:
+    if not LOG_CHANNEL_ID:
+        return None
+    ch = bot.get_channel(LOG_CHANNEL_ID)
+    if ch:
+        return ch
+    try:
+        return await bot.fetch_channel(LOG_CHANNEL_ID)
+    except Exception:
+        return None
+
+async def send_embed_log(member: discord.Member, action: str, color: discord.Color, description: str):
+    ch = await get_log_channel()
+    if not ch:
+        return
+    try:
+        embed = discord.Embed(title=f"🎧 Voice Update: {action}", description=description, color=color, timestamp=now_utc())
+        embed.set_author(name=member.display_name, icon_url=member.display_avatar.url if member.display_avatar else None)
+        embed.set_thumbnail(url=member.display_avatar.url if member.display_avatar else None)
+        await ch.send(embed=embed)
+    except Exception as e:
+        print("[WARN] failed to send embed log:", e)
+
+def record_session_end(user_id: int, start_ts: float, end_ts: float) -> int:
+    dur = int(end_ts - start_ts)
+    key = str(user_id)
+    user_totals[key] = user_totals.get(key, 0) + dur
+    return dur
+
+# -------------------- Startup --------------------
 @bot.event
 async def on_ready():
-    global voice_history, user_totals, stay_channels
+    global voice_history, user_totals, persistent_stays
 
-    voice_history = load_json(HISTORY_FILE, [])
-    user_totals = load_json(TOTALS_FILE, {})
-    stay_channels = {int(k): int(v) for k, v in load_json(STAY_FILE, {}).items()}
+    # load persisted files
+    voice_history = safe_read_json(HISTORY_FILE, [])
+    user_totals = safe_read_json(TOTALS_FILE, {})
+    raw = safe_read_json(STAY_FILE, {})
+    if isinstance(raw, dict):
+        persistent_stays = {int(k): int(v) for k, v in raw.items()}
+    else:
+        persistent_stays = {}
 
-    # Rebuild active sessions for people already in VC
-    for guild in bot.guilds:
-        for vc in guild.voice_channels:
-            for m in vc.members:
-                if not m.bot:
-                    active_sessions[m.id] = now().timestamp()
+    print(f"✅ Logged in as {bot.user} ({bot.user.id}) - {ts()}")
+    print(f"Loaded: {len(voice_history)} history lines, {len(user_totals)} totals, {len(persistent_stays)} stays")
 
-    print(f"Logged in as {bot.user}")
-    ch = await get_log_channel()
-    if ch:
-        await ch.send("✅ Bot restarted and loaded data.")
+    # Rebuild active sessions from current voice states if we have members intent
+    if intents.members:
+        for g in bot.guilds:
+            for vc in g.voice_channels:
+                for m in vc.members:
+                    if not m.bot and m.id not in user_sessions:
+                        user_sessions[m.id] = datetime.now(timezone.utc).timestamp()
 
+    # Start the stay background worker
     bot.loop.create_task(stay_worker())
 
-# ==============================
-# VOICE EVENT HANDLER
-# ==============================
+    # announce startup to log channel
+    ch = await get_log_channel()
+    if ch:
+        try:
+            await ch.send(f"✅ Bot started ({bot.user}) — active sessions: {len(user_sessions)}")
+        except Exception:
+            pass
+
+# -------------------- Voice state handling --------------------
 @bot.event
-async def on_voice_state_update(m, before, after):
-    if m.bot:
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # ignore bots
+    if member.bot:
         return
 
-    t = now().timestamp()
-    entry = None
+    now_ts = datetime.now(timezone.utc).timestamp()
+    action = None
+    desc = ""
+    color = discord.Color.blue()
+    log_line = None
 
-    # JOIN
+    # joined
     if before.channel is None and after.channel is not None:
-        active_sessions[m.id] = t
-        entry = f"[{now()}] JOIN {m.display_name} → {after.channel.name}"
+        user_sessions[member.id] = now_ts
+        action = "Joined"
+        desc = f"🔊 **{member.mention}** joined **{after.channel.name}**"
+        color = discord.Color.green()
+        log_line = f"[{ts()}] JOIN {member.display_name} -> {after.channel.name}"
 
-    # LEAVE
+    # left
     elif before.channel is not None and after.channel is None:
-        start = active_sessions.pop(m.id, None)
-        dur = 0
+        start = user_sessions.pop(member.id, None)
+        dur_text = ""
         if start:
-            dur = int(t - start)
-            user_totals[str(m.id)] = user_totals.get(str(m.id), 0) + dur
-        entry = f"[{now()}] LEAVE {m.display_name} ← {before.channel.name} ({fmt_time(dur)})"
+            dur = record_session_end(member.id, start, now_ts)
+            dur_text = f" (Stayed: {fmt_duration(dur)})"
+        action = "Left"
+        desc = f"❌ **{member.mention}** left **{before.channel.name}**{dur_text}"
+        color = discord.Color.red()
+        log_line = f"[{ts()}] LEAVE {member.display_name} <- {before.channel.name}{dur_text}"
 
-    # MOVE
-    elif (before.channel is not None and after.channel is not None and
-          before.channel.id != after.channel.id):
-        start = active_sessions.get(m.id)
-        dur = 0
+    # moved channel
+    elif before.channel is not None and after.channel is not None and before.channel.id != after.channel.id:
+        start = user_sessions.get(member.id)
+        dur_text = ""
         if start:
-            dur = int(t - start)
-            user_totals[str(m.id)] = user_totals.get(str(m.id), 0) + dur
-        active_sessions[m.id] = t
-        entry = (f"[{now()}] MOVE {m.display_name}: {before.channel.name} → {after.channel.name}"
-                 f" ({fmt_time(dur)})")
+            dur = record_session_end(member.id, start, now_ts)
+            dur_text = f" (Stayed in {before.channel.name}: {fmt_duration(dur)})"
+        user_sessions[member.id] = now_ts
+        action = "Moved"
+        desc = f"➡️ **{member.mention}** moved from **{before.channel.name}** → **{after.channel.name}**{dur_text}"
+        color = discord.Color.orange()
+        log_line = f"[{ts()}] MOVE {member.display_name}: {before.channel.name} -> {after.channel.name}{dur_text}"
 
-    if entry:
-        voice_history.append(entry)
-        voice_history[:] = voice_history[-800:]  # anti-bloat
-        await save_json(HISTORY_FILE, voice_history)
-        await save_json(TOTALS_FILE, user_totals)
-        print(entry)
+    # if we made a log event, persist + send to log channel
+    if log_line:
+        voice_history.append(log_line)
+        # trim
+        if len(voice_history) > MAX_HISTORY:
+            voice_history[:] = voice_history[-MAX_HISTORY:]
+        try:
+            await persist_all()
+        except Exception as e:
+            print("[WARN] persist failed:", e)
+        print(log_line)
+        await send_embed_log(member, action or "Voice", color, desc)
 
-# ==============================
-# COMMANDS
-# ==============================
-@bot.command()
-async def vchistory(ctx, n: int = 10):
-    n = max(1, min(50, n))
+# -------------------- Commands --------------------
+@bot.event
+async def on_message(message: discord.Message):
+    # ignore DMs & bots
+    if message.author.bot:
+        return
+    await bot.process_commands(message)
+
+@bot.command(name="ping")
+async def ping_cmd(ctx: commands.Context):
+    await ctx.send("pong")
+
+@bot.command(name="vchistory")
+async def vchistory_cmd(ctx: commands.Context, limit: int = 10):
+    limit = max(1, min(limit, 50))
     if not voice_history:
-        return await ctx.send("No history.")
-    logs = "\n".join(voice_history[-n:])
-    await ctx.send(f"```\n{logs}\n```")
+        return await ctx.send("No voice history yet.")
+    logs = "\n".join(voice_history[-limit:])
+    # send as code block if long
+    if len(logs) > 1800:
+        await ctx.send(f"```{logs[:1900]}```")
+    else:
+        await ctx.send(f"```{logs}```")
 
-@bot.command()
-async def vcstats(ctx, member: discord.Member = None):
+@bot.command(name="vcstats")
+async def vcstats_cmd(ctx: commands.Context, member: Optional[discord.Member] = None):
     member = member or ctx.author
-    total = user_totals.get(str(member.id), 0)
-    if member.id in active_sessions:
-        total += int(now().timestamp() - active_sessions[member.id])
-    await ctx.send(f"**{member.display_name}** has {fmt_time(total)} in voice.")
+    total = int(user_totals.get(str(member.id), 0))
+    if member.id in user_sessions:
+        total += int(datetime.now(timezone.utc).timestamp() - user_sessions[member.id])
+    await ctx.send(f"**{member.display_name}** total VC time: **{fmt_duration(total)}**")
 
-@bot.command()
-async def vcleaderboard(ctx, n: int = 10):
-    n = max(1, min(25, n))
-    data = {}
-    for uid, sec in user_totals.items():
-        uid_int = int(uid)
-        total = sec
-        if uid_int in active_sessions:
-            total += int(now().timestamp() - active_sessions[uid_int])
-        data[uid_int] = total
+@bot.command(name="vcleaderboard", aliases=["vcleaders", "vctop"])
+async def vcleaderboard_cmd(ctx: commands.Context, top: int = 10):
+    top = max(1, min(top, 25))
+    combined: Dict[int, int] = {}
+    # start with stored totals
+    for uid_str, secs in user_totals.items():
+        try:
+            uid = int(uid_str)
+        except:
+            continue
+        combined[uid] = int(secs)
+    # add live sessions
+    for uid, start_ts in user_sessions.items():
+        combined[uid] = combined.get(uid, 0) + int(datetime.now(timezone.utc).timestamp() - start_ts)
+    if not combined:
+        return await ctx.send("No voice time recorded yet.")
+    items = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:top]
+    lines = []
+    rank = 1
+    for uid, secs in items:
+        user = None
+        display = str(uid)
+        try:
+            if ctx.guild:
+                user = ctx.guild.get_member(uid)
+            if not user:
+                user = bot.get_user(uid)
+            if user:
+                display = user.display_name if isinstance(user, discord.Member) else f"{user.name}#{user.discriminator}"
+        except Exception:
+            pass
+        live_marker = " 🔴" if uid in user_sessions else ""
+        lines.append(f"#{rank} • **{display}** — {fmt_duration(secs)}{live_marker}")
+        rank += 1
+    await ctx.send("\n".join(lines))
 
-    if not data:
-        return await ctx.send("No data.")
+@bot.command(name="forcejoin")
+@commands.has_permissions(manage_guild=True)
+async def forcejoin_cmd(ctx: commands.Context, channel_id: int):
+    guild = ctx.guild
+    ch = guild.get_channel(channel_id) if guild else None
+    if ch is None:
+        return await ctx.send(f"Channel ID {channel_id} not found in this guild.")
+    try:
+        vc = discord.utils.get(bot.voice_clients, guild=guild)
+        if vc and vc.is_connected():
+            await vc.move_to(ch)
+        else:
+            await ch.connect()
+        await ctx.send(f"✅ Joined {ch.name}")
+    except discord.Forbidden:
+        await ctx.send("❌ Forbidden: check Connect/Speak permissions for me.")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to join: {e}")
+        print("forcejoin error:", traceback.format_exc())
 
-    ranked = sorted(data.items(), key=lambda x: x[1], reverse=True)[:n]
+# 24/7 stay commands
+@bot.command(name="stayvc")
+@commands.has_permissions(connect=True)
+async def stayvc_cmd(ctx: commands.Context):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.send("You must be in a voice channel. Join a channel and run this command.")
+    channel = ctx.author.voice.channel
+    persistent_stays[ctx.guild.id] = channel.id
+    try:
+        await safe_write_json(STAY_FILE, {str(k): v for k, v in persistent_stays.items()})
+    except Exception:
+        pass
+    # try immediate join
+    try:
+        vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+        if vc and vc.is_connected():
+            await vc.move_to(channel)
+        else:
+            await channel.connect()
+        await ctx.send(f"✅ I will stay in **{channel.name}** 24/7 for this server.")
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have permission to join that voice channel (Connect/Speak).")
+    except Exception as e:
+        await ctx.send(f"⚠️ I failed to join right now: {e}")
 
-    msg = []
-    r = 1
-    for uid, sec in ranked:
-        user = ctx.guild.get_member(uid) or bot.get_user(uid)
-        name = user.display_name if isinstance(user, discord.Member) else (user.name if user else uid)
-        live = " 🔴" if uid in active_sessions else ""
-        msg.append(f"#{r} **{name}** — {fmt_time(sec)}{live}")
-        r += 1
+@bot.command(name="setstayvc")
+@commands.has_permissions(manage_guild=True)
+async def setstayvc_cmd(ctx: commands.Context, channel: discord.VoiceChannel):
+    persistent_stays[ctx.guild.id] = channel.id
+    try:
+        await safe_write_json(STAY_FILE, {str(k): v for k, v in persistent_stays.items()})
+    except Exception:
+        pass
+    # try immediate join
+    try:
+        vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+        if vc and vc.is_connected():
+            await vc.move_to(channel)
+        else:
+            await channel.connect()
+        await ctx.send(f"✅ Persistent stay set to **{channel.name}**")
+    except discord.Forbidden:
+        await ctx.send("❌ I lack permissions to join (Connect/Speak).")
+    except Exception as e:
+        await ctx.send(f"⚠️ Failed to join: {e}")
 
-    await ctx.send("\n".join(msg))
+@bot.command(name="unstayvc")
+@commands.has_permissions(manage_guild=True)
+async def unstayvc_cmd(ctx: commands.Context):
+    persistent_stays.pop(ctx.guild.id, None)
+    try:
+        await safe_write_json(STAY_FILE, {str(k): v for k, v in persistent_stays.items()})
+    except Exception:
+        pass
+    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if vc and vc.is_connected():
+        try:
+            await vc.disconnect()
+        except Exception:
+            pass
+    await ctx.send("✅ Persistent stay removed for this server.")
 
-# ==============================
-# 24/7 STAY
-# ==============================
+@bot.command(name="staystatus")
+async def staystatus_cmd(ctx: commands.Context):
+    guild_id = ctx.guild.id
+    if guild_id not in persistent_stays:
+        return await ctx.send("No persistent stay set. Use `!stayvc` or `!setstayvc`.")
+    ch = ctx.guild.get_channel(persistent_stays[guild_id])
+    name = ch.name if ch else f"<deleted:{persistent_stays[guild_id]}>"
+    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    connected = bool(vc and vc.is_connected() and vc.channel.id == persistent_stays[guild_id])
+    await ctx.send(f"📌 Staying in **{name}** — connected: {connected}")
+
+# -------------------- Background stay worker --------------------
 async def stay_worker():
     await bot.wait_until_ready()
-    print("Stay worker started")
-
+    print("Stay worker running.")
     while True:
-        for guild_id, channel_id in list(stay_channels.items()):
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                stay_channels.pop(guild_id, None)
-                await save_json(STAY_FILE, stay_channels)
-                continue
-            ch = guild.get_channel(channel_id)
-            if not ch:
-                stay_channels.pop(guild_id, None)
-                await save_json(STAY_FILE, stay_channels)
-                continue
+        try:
+            for guild_id, channel_id in list(persistent_stays.items()):
+                guild = bot.get_guild(guild_id)
+                if not guild:
+                    persistent_stays.pop(guild_id, None)
+                    await safe_write_json(STAY_FILE, {str(k): v for k, v in persistent_stays.items()})
+                    continue
+                channel = guild.get_channel(channel_id)
+                if not channel:
+                    persistent_stays.pop(guild_id, None)
+                    await safe_write_json(STAY_FILE, {str(k): v for k, v in persistent_stays.items()})
+                    continue
+                vc = discord.utils.get(bot.voice_clients, guild=guild)
+                if vc and vc.is_connected() and vc.channel.id == channel_id:
+                    continue
+                try:
+                    if vc and vc.is_connected():
+                        await vc.move_to(channel)
+                    else:
+                        await channel.connect(reconnect=True)
+                except discord.Forbidden:
+                    print(f"[WARN] Forbidden to connect to channel {channel.name} ({channel.id}) in guild {guild.name}")
+                except Exception as e:
+                    print("[WARN] stay connect failed:", e)
+            await asyncio.sleep(STAY_CHECK_INTERVAL)
+        except Exception as e:
+            print("[ERROR] stay_worker crashed:", e)
+            traceback.print_exc()
+            await asyncio.sleep(10)
 
-            vc = discord.utils.get(bot.voice_clients, guild=guild)
-            if vc and vc.channel.id == channel_id:
-                continue
-            try:
-                if vc:
-                    await vc.move_to(ch)
-                else:
-                    await ch.connect()
-            except Exception as e:
-                print("Stay connect fail:", e)
-
-        await asyncio.sleep(30)
-
-@bot.command()
-@commands.has_permissions(manage_guild=True)
-async def setstay(ctx, channel: discord.VoiceChannel):
-    stay_channels[ctx.guild.id] = channel.id
-    await save_json(STAY_FILE, stay_channels)
-    await ctx.send(f"Bot will stay in **{channel.name}** 24/7.")
-
-@bot.command()
-@commands.has_permissions(manage_guild=True)
-async def unstay(ctx):
-    stay_channels.pop(ctx.guild.id, None)
-    await save_json(STAY_FILE, stay_channels)
-    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
-    if vc:
-        await vc.disconnect()
-    await ctx.send("Bot will no longer stay in voice.")
-
-# ==============================
-# RUN
-# ==============================
-token = os.getenv("DISCORD_TOKEN")
-if not token:
-    raise SystemExit("ERROR: DISCORD_TOKEN not set.")
-
-bot.run(token)
+# -------------------- Run --------------------
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        print("ERROR: DISCORD_TOKEN not set. Set this environment variable and restart the bot.")
+        raise SystemExit(1)
+    try:
+        bot.run(token)
+    except discord.errors.PrivilegedIntentsRequired:
+        print("ERROR: Privileged intents required. Enable SERVER MEMBERS and MESSAGE CONTENT intents in Developer Portal.")
+        raise
+    except Exception as e:
+        print("Bot crashed:", e)
+        traceback.print_exc()
+        raise
